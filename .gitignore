@@ -1,0 +1,17 @@
+# Secrets
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Database
+*.db
+
+# IDE
+.idea/
+
+# Claude
+.claude/
