@@ -9,9 +9,6 @@ from culture_data import get_music_data, get_food_data, get_movie_data
 from spotify import spotify_enabled, search_country_playlists
 from country_facts import get_country_facts
 
-# Allow OAuth over plain HTTP for localhost development
-os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
-
 # ── Google OAuth helpers ────────────────────────────────────────────────────────
 
 _GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/auth"
@@ -22,7 +19,26 @@ _GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
-_REDIRECT_URI = "http://localhost:8501"
+def _app_url() -> str:
+    """
+    Public base URL of this app. Google sends the user back here after login, so
+    it must match an Authorized redirect URI in the Google Cloud console exactly.
+    Defaults to the local dev server.
+    """
+    try:
+        url = st.secrets.get("APP_URL", "")
+    except Exception:
+        url = ""
+    url = url or os.environ.get("APP_URL", "")
+    return (url or "http://localhost:8501").rstrip("/")
+
+
+_REDIRECT_URI = _app_url()
+
+# oauthlib refuses to run OAuth over plain HTTP unless told otherwise. That is
+# fine for localhost; a real deployment is HTTPS and must keep the check on.
+if _REDIRECT_URI.startswith("http://"):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
 
 def _google_creds():
@@ -205,7 +221,7 @@ if "google_oauth_state" not in st.session_state:
     st.session_state.google_oauth_state = None
 
 # ── Handle Google OAuth callback ───────────────────────────────────────────────
-# Google redirects back to localhost:8501?code=...&state=...
+# Google redirects back to APP_URL?code=...&state=...
 _params = st.query_params
 if "code" in _params and st.session_state.user is None:
     try:
@@ -452,6 +468,11 @@ def render_culture(country: str):
         f'</div>',
         unsafe_allow_html=True,
     )
+
+    # The curated facts above always render; the live ones (capital, population,
+    # flag, languages, currency) can't. Say so rather than showing a thin card.
+    if not facts["live_ok"]:
+        st.caption(f"⚠️ Live country data unavailable — {facts['live_error']}")
 
     st.markdown("---")
 

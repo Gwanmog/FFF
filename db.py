@@ -1,146 +1,272 @@
-import sqlite3
+"""
+Persistence layer.
+
+Two backends, chosen by whether DATABASE_URL is set:
+  - unset  -> local SQLite file (development)
+  - set    -> Postgres (Supabase / Neon / any managed Postgres)
+
+Streamlit Community Cloud has an ephemeral filesystem, so a SQLite file there is
+wiped on every reboot and redeploy. Set DATABASE_URL in the Cloud secrets to keep
+accounts and passport history.
+"""
+
 import hashlib
+import hmac
 import os
+import secrets
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
+
+import streamlit as st
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "funky_fresh.db")
 
+PBKDF2_ROUNDS = 240_000
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+
+def _setting(name: str) -> str:
+    """Read a config value from st.secrets, falling back to the environment."""
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return value or os.environ.get(name, "")
+
+
+def _database_url() -> str:
+    url = _setting("DATABASE_URL")
+    if url.startswith("postgres://"):
+        # psycopg2 only accepts the postgresql:// spelling
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def is_postgres() -> bool:
+    return bool(_database_url())
+
+
+def backend_name() -> str:
+    return "postgres" if is_postgres() else "sqlite"
+
+
+# -- Connections ---------------------------------------------------------------
+
+
+@st.cache_resource(show_spinner=False)
+def _pg_connect():
+    import psycopg2
+
+    conn = psycopg2.connect(_database_url())
+    conn.autocommit = True
     return conn
 
 
+def _pg_live():
+    """Cached Postgres connection, re-established if the server dropped it."""
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        _pg_connect.clear()
+        conn = _pg_connect()
+    return conn
+
+
+@contextmanager
+def _cursor():
+    """Yield a cursor whose rows are keyed by column name, on either backend."""
+    if is_postgres():
+        import psycopg2.extras
+
+        cur = _pg_live().cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            yield cur
+        finally:
+            cur.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn.cursor()
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _sql(query: str) -> str:
+    """Queries are written with '?'; Postgres wants '%s'."""
+    return query.replace("?", "%s") if is_postgres() else query
+
+
+def _query_one(query: str, params: tuple = ()):
+    with _cursor() as cur:
+        cur.execute(_sql(query), params)
+        return cur.fetchone()
+
+
+def _query_all(query: str, params: tuple = ()) -> list:
+    with _cursor() as cur:
+        cur.execute(_sql(query), params)
+        return cur.fetchall() or []
+
+
+def _execute(query: str, params: tuple = ()) -> None:
+    with _cursor() as cur:
+        cur.execute(_sql(query), params)
+
+
+def _integrity_errors() -> tuple:
+    errors = [sqlite3.IntegrityError]
+    if is_postgres():
+        import psycopg2
+
+        errors.append(psycopg2.IntegrityError)
+    return tuple(errors)
+
+
+# -- Schema --------------------------------------------------------------------
+
+
 def init_db():
-    conn = get_conn()
-    # Create tables (password_hash may be empty for Google users)
-    conn.executescript("""
+    serial = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+    _execute(f"""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {serial},
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+        )
+    """)
+    _execute(f"""
         CREATE TABLE IF NOT EXISTS user_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {serial},
             user_id INTEGER NOT NULL,
             country TEXT NOT NULL,
-            visited_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
+            visited_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
     """)
-    # Migration: add google_id column if it doesn't exist yet
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN google_id TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    conn.close()
+
+    # Migration: add google_id to databases created before Google login existed.
+    if is_postgres():
+        _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT")
+    else:
+        try:
+            _execute("ALTER TABLE users ADD COLUMN google_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # already there
 
 
-def _hash_pw(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+# -- Passwords -----------------------------------------------------------------
+# Stored as pbkdf2_sha256$<rounds>$<salt>$<hash>. Accounts created before this
+# change hold a bare SHA-256 digest and are upgraded on their next login.
+
+
+def _hash_pw(password: str, salt: str = "", rounds: int = PBKDF2_ROUNDS) -> str:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), rounds)
+    return f"pbkdf2_sha256${rounds}${salt}${digest.hex()}"
+
+
+def _verify_pw(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds, salt, _ = stored.split("$", 3)
+        except ValueError:
+            return False
+        return hmac.compare_digest(_hash_pw(password, salt, int(rounds)), stored)
+    # Legacy unsalted SHA-256
+    legacy = hashlib.sha256(password.encode()).hexdigest()
+    return hmac.compare_digest(legacy, stored)
+
+
+def _is_legacy_hash(stored: str) -> bool:
+    return bool(stored) and not stored.startswith("pbkdf2_sha256$")
+
+
+# -- Users ---------------------------------------------------------------------
 
 
 def create_user(username: str, password: str) -> bool:
-    conn = get_conn()
     try:
-        conn.execute(
+        _execute(
             "INSERT INTO users (username, password_hash) VALUES (?, ?)",
             (username, _hash_pw(password)),
         )
-        conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except _integrity_errors():
         return False
-    finally:
-        conn.close()
 
 
 def authenticate(username: str, password: str):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT id, username FROM users WHERE username = ? AND password_hash = ?",
-        (username, _hash_pw(password)),
-    ).fetchone()
-    conn.close()
-    if row:
-        return {"id": row["id"], "username": row["username"]}
-    return None
+    row = _query_one(
+        "SELECT id, username, password_hash FROM users WHERE username = ?",
+        (username,),
+    )
+    if not row or not _verify_pw(password, row["password_hash"]):
+        return None
+
+    if _is_legacy_hash(row["password_hash"]):
+        _execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (_hash_pw(password), row["id"]),
+        )
+
+    return {"id": row["id"], "username": row["username"]}
 
 
 def find_or_create_google_user(google_id: str, email: str, name: str) -> dict:
     """Find an existing Google-linked account or create a new one."""
-    conn = get_conn()
-    # Try to find by google_id
-    row = conn.execute(
-        "SELECT id, username FROM users WHERE google_id = ?",
-        (google_id,),
-    ).fetchone()
+    row = _query_one("SELECT id, username FROM users WHERE google_id = ?", (google_id,))
     if row:
-        conn.close()
         return {"id": row["id"], "username": row["username"]}
 
-    # New Google user — derive a unique username from their name/email
+    # New Google user - derive a unique username from their name/email
     base = name.split()[0] if name else email.split("@")[0]
     base = "".join(c for c in base if c.isalnum())[:20] or "user"
     username = base
     suffix = 1
-    while True:
-        existing = conn.execute(
-            "SELECT id FROM users WHERE username = ?", (username,)
-        ).fetchone()
-        if not existing:
-            break
+    while _query_one("SELECT id FROM users WHERE username = ?", (username,)):
         username = f"{base}{suffix}"
         suffix += 1
 
-    conn.execute(
+    _execute(
         "INSERT INTO users (username, password_hash, google_id) VALUES (?, '', ?)",
         (username, google_id),
     )
-    conn.commit()
-    user_id = conn.execute(
-        "SELECT id FROM users WHERE google_id = ?", (google_id,)
-    ).fetchone()["id"]
-    conn.close()
-    return {"id": user_id, "username": username}
+    created = _query_one("SELECT id FROM users WHERE google_id = ?", (google_id,))
+    return {"id": created["id"], "username": username}
+
+
+# -- History -------------------------------------------------------------------
 
 
 def get_past_countries(user_id: int) -> list[dict]:
-    conn = get_conn()
-    rows = conn.execute(
+    rows = _query_all(
         "SELECT country, visited_at FROM user_history WHERE user_id = ? ORDER BY visited_at ASC",
         (user_id,),
-    ).fetchall()
-    conn.close()
+    )
     return [{"country": r["country"], "visited_at": r["visited_at"]} for r in rows]
 
 
 def add_country(user_id: int, country: str):
-    conn = get_conn()
-    conn.execute(
+    _execute(
         "INSERT INTO user_history (user_id, country, visited_at) VALUES (?, ?, ?)",
         (user_id, country, datetime.now().isoformat()),
     )
-    conn.commit()
-    conn.close()
 
 
 def clear_history(user_id: int):
-    conn = get_conn()
-    conn.execute("DELETE FROM user_history WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    _execute("DELETE FROM user_history WHERE user_id = ?", (user_id,))
 
 
 def remove_country(user_id: int, country: str):
     """Remove a single country from a user's history."""
-    conn = get_conn()
-    conn.execute(
+    _execute(
         "DELETE FROM user_history WHERE user_id = ? AND country = ?",
         (user_id, country),
     )
-    conn.commit()
-    conn.close()

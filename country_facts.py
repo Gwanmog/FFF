@@ -1,88 +1,228 @@
 """
 Country facts module.
-- Live data (capital, population, languages, currency, area, flag) from RestCountries API.
+- Live data (capital, population, languages, currency, area, flag) from the
+  RestCountries API (v5 — needs a free API key).
 - Curated data (religion, industries, national sport, fun fact) from local dicts.
+
+The live half is optional. Without a key the curated facts still render, and the
+card says *why* the live fields are missing rather than quietly dropping them.
 """
 
+import os
 import requests
 import streamlit as st
 
-# ── RestCountries name overrides ────────────────────────────────────────────────
-# Maps our display names → names RestCountries understands
+# ── RestCountries v5 ───────────────────────────────────────────────────────────
+# v3.1 was deprecated and now answers HTTP 200 with a JSON error envelope, which
+# is exactly why a plain status-code check is not enough to detect the failure.
 
-NAME_MAP = {
-    "Bolivia": "Bolivia (Plurinational State of)",
-    "Bosnia and Herzegovina": "Bosnia and Herzegovina",
-    "Brunei": "Brunei Darussalam",
-    "Cabo Verde": "Cabo Verde",
-    "Congo (Democratic Republic)": "Congo, Democratic Republic of the",
-    "Congo (Republic)": "Congo",
+API_BASE = "https://api.restcountries.com/countries/v5"
+API_TIMEOUT = 8
+
+# v5 rejects unauthenticated requests before it routes them, so the endpoint
+# spelling can't be confirmed without a live key. `names.common` is what the v5
+# docs show; the second is the older spelling, tried only if the first 404s.
+# If both miss, check_setup.py prints the exact URL it tried.
+ENDPOINTS = ("names.common", "name")
+
+# Our display name → the name v5 indexes under `names.common`. v5 matches on the
+# *common* name, so most of our names need no alias at all — only the handful
+# below genuinely disagree. Run `python check_facts_api.py` to find any others.
+NAME_ALIASES = {
+    "Cabo Verde": "Cape Verde",
+    "Congo (Democratic Republic)": "DR Congo",
+    "Congo (Republic)": "Republic of the Congo",
     "East Timor": "Timor-Leste",
-    "Eswatini": "Eswatini",
     "Ivory Coast": "Côte d'Ivoire",
-    "Kosovo": "Kosovo",
-    "Laos": "Lao People's Democratic Republic",
-    "Moldova": "Moldova (Republic of)",
-    "North Korea": "Korea (Democratic People's Republic of)",
-    "Palestine": "Palestine, State of",
-    "Russia": "Russian Federation",
-    "South Korea": "Korea, Republic of",
-    "Syria": "Syrian Arab Republic",
-    "Taiwan": "Taiwan, Province of China",
-    "Tanzania": "Tanzania, United Republic of",
-    "Trinidad and Tobago": "Trinidad and Tobago",
-    "United Kingdom": "United Kingdom of Great Britain and Northern Ireland",
-    "United States": "United States of America",
-    "Venezuela": "Venezuela (Bolivarian Republic of)",
-    "Vietnam": "Viet Nam",
-    "Vatican City": "Holy See",
-    "Micronesia": "Micronesia (Federated States of)",
-    "Iran": "Iran (Islamic Republic of)",
+    "Myanmar": "Myanmar",
+    "Vatican City": "Vatican City",
 }
 
 
-@st.cache_data(ttl=86400)
-def fetch_rest_countries(country: str) -> dict:
-    """Fetch basic facts from restcountries.com. Returns {} on failure."""
-    name = NAME_MAP.get(country, country)
+EMPTY_LIVE = {
+    "capital": "N/A",
+    "population": 0,
+    "area": 0,
+    "flag": "",
+    "region": "",
+    "languages": [],
+    "currencies": [],
+    "timezones": [],
+}
+
+
+def _api_key() -> str:
+    """RestCountries v5 API key from st.secrets, falling back to the env var."""
+    try:
+        key = st.secrets.get("RESTCOUNTRIES_API_KEY", "")
+    except Exception:
+        key = ""
+    key = key or os.environ.get("RESTCOUNTRIES_API_KEY", "")
+    return "" if key.startswith("your-") else key
+
+
+def facts_api_enabled() -> bool:
+    return bool(_api_key())
+
+
+def _envelope_error(payload) -> str:
+    """Pull a human message out of an error envelope, if that's what this is."""
+    if isinstance(payload, dict) and payload.get("errors"):
+        errors = payload["errors"]
+        if isinstance(errors, list) and errors:
+            first = errors[0]
+            if isinstance(first, dict):
+                return str(first.get("message") or first)
+            return str(first)
+        return str(errors)
+    return ""
+
+
+def _parse_v5(obj: dict) -> dict:
+    """Map one v5 country object onto our flat facts shape."""
+    capitals = obj.get("capitals") or []
+    capital = "N/A"
+    if capitals:
+        first = capitals[0]
+        capital = (first.get("name") if isinstance(first, dict) else str(first)) or "N/A"
+
+    area = obj.get("area") or 0
+    if isinstance(area, dict):
+        area = area.get("kilometers") or 0
+
+    flag = obj.get("flag") or ""
+    if isinstance(flag, dict):
+        flag = flag.get("emoji") or ""
+
+    languages = []
+    for lang in obj.get("languages") or []:
+        if isinstance(lang, dict):
+            name = lang.get("name")
+            if name:
+                languages.append(name)
+        elif lang:
+            languages.append(str(lang))
+
+    currencies = []
+    raw_currencies = obj.get("currencies") or {}
+    if isinstance(raw_currencies, dict):
+        items = raw_currencies.items()
+    else:
+        items = [(c.get("code", ""), c) for c in raw_currencies if isinstance(c, dict)]
+    for code, val in items:
+        if isinstance(val, dict):
+            symbol = val.get("symbol", "")
+            name = val.get("name", code)
+            currencies.append(f"{name} ({symbol})" if symbol else str(name))
+
+    return {
+        "capital": capital,
+        "population": obj.get("population") or 0,
+        "area": area,
+        "flag": flag,
+        "region": obj.get("subregion") or obj.get("region") or "",
+        "languages": languages,
+        "currencies": currencies,
+        "timezones": obj.get("timezones") or [],
+    }
+
+
+def _request_once(url: str, key: str) -> tuple[dict | None, str, bool]:
+    """
+    One HTTP lookup. Returns (country_object, error_message, worth_retrying).
+
+    `worth_retrying` distinguishes "this URL/name was wrong, try another" from
+    "the key or the service is broken, stop here".
+    """
     try:
         resp = requests.get(
-            f"https://restcountries.com/v3.1/name/{requests.utils.quote(name)}",
-            params={"fullText": "true"},
-            timeout=8,
+            url,
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            timeout=API_TIMEOUT,
         )
-        if resp.status_code != 200:
-            # Fallback: partial name search
-            resp = requests.get(
-                f"https://restcountries.com/v3.1/name/{requests.utils.quote(country)}",
-                timeout=8,
-            )
-        if resp.status_code != 200:
-            return {}
-        data = resp.json()[0]
-        languages = list(data.get("languages", {}).values())
-        currencies = [
-            f"{v.get('name', k)} ({v.get('symbol', '')})"
-            for k, v in data.get("currencies", {}).items()
-        ]
-        capital = data.get("capital", ["N/A"])[0] if data.get("capital") else "N/A"
-        population = data.get("population", 0)
-        area = data.get("area", 0)
-        flag = data.get("flag", "")
-        region = data.get("subregion") or data.get("region", "")
-        timezones = data.get("timezones", [])
+    except requests.RequestException as e:
+        return None, f"Could not reach RestCountries: {e}", False
+
+    if resp.status_code in (401, 403):
+        return None, f"RestCountries rejected the API key (HTTP {resp.status_code}).", False
+    if resp.status_code == 429:
+        return None, "RestCountries rate limit reached (HTTP 429).", False
+    if resp.status_code == 404:
+        return None, f"Not found: {url}", True
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, f"RestCountries returned non-JSON (HTTP {resp.status_code}) from {url}", False
+
+    # A deprecated or failed API can answer HTTP 200 with an error envelope —
+    # which is exactly how v3.1 broke — so check the body, not just the status.
+    envelope_msg = _envelope_error(payload)
+    if envelope_msg:
+        return None, envelope_msg, True
+    if resp.status_code != 200:
+        return None, f"RestCountries returned HTTP {resp.status_code} from {url}", False
+
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    objects = data.get("objects") if isinstance(data, dict) else data
+    if isinstance(objects, dict):
+        objects = [objects]
+    if not objects:
+        return None, f"No RestCountries match at {url}", True
+    return objects[0], "", False
+
+
+def _request(name: str, key: str) -> tuple[dict | None, str]:
+    """Look one country up, trying each known endpoint spelling."""
+    last_error = ""
+    for endpoint in ENDPOINTS:
+        url = f"{API_BASE}/{endpoint}/{requests.utils.quote(name)}"
+        obj, error, retry = _request_once(url, key)
+        if obj is not None:
+            return obj, ""
+        last_error = error
+        if not retry:
+            break
+    return None, last_error
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_rest_countries(country: str) -> dict:
+    """
+    Fetch live facts for `country`.
+
+    Always returns the full facts shape plus `ok`/`error`, so a failure shows up
+    as a visible message instead of a card that has quietly gone blank.
+    """
+    key = _api_key()
+    if not key:
         return {
-            "capital": capital,
-            "population": population,
-            "area": area,
-            "flag": flag,
-            "region": region,
-            "languages": languages,
-            "currencies": currencies,
-            "timezones": timezones,
+            **EMPTY_LIVE,
+            "ok": False,
+            "error": "No RESTCOUNTRIES_API_KEY configured — live facts are off.",
         }
-    except Exception:
-        return {}
+
+    # Try our display name first (v5 matches on the common name), then the alias.
+    candidates = [country]
+    alias = NAME_ALIASES.get(country)
+    if alias and alias != country:
+        candidates.append(alias)
+
+    last_error = ""
+    for name in candidates:
+        obj, error = _request(name, key)
+        if obj is not None:
+            try:
+                return {**_parse_v5(obj), "ok": True, "error": ""}
+            except Exception as e:  # unexpected shape — say so, don't blank out
+                return {
+                    **EMPTY_LIVE,
+                    "ok": False,
+                    "error": f"Could not parse RestCountries response: {e}",
+                }
+        last_error = error
+
+    return {**EMPTY_LIVE, "ok": False, "error": last_error or "Lookup failed."}
 
 
 # ── Curated cultural facts ──────────────────────────────────────────────────────
@@ -906,4 +1046,7 @@ def get_country_facts(country: str) -> dict:
         "national_sport": NATIONAL_SPORTS.get(country, ""),
         "major_industries": MAJOR_INDUSTRIES.get(country, ""),
         "fun_fact": FUN_FACTS.get(country, ""),
+        # Live-fetch status, so the UI can explain a half-empty card
+        "live_ok": live.get("ok", False),
+        "live_error": live.get("error", ""),
     }
