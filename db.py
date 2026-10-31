@@ -3,7 +3,11 @@ Persistence layer.
 
 Two backends, chosen by whether DATABASE_URL is set:
   - unset  -> local SQLite file (development)
-  - set    -> Postgres (Supabase / Neon / any managed Postgres)
+  - set    -> Postgres (Neon / any managed Postgres)
+
+Locally, DATABASE_URL and NEON_AUTH_BASE_URL come from .env.local, which
+`neon deploy` / `neon env pull` write. Use the pooled DATABASE_URL (the default
+one Neon writes): Streamlit holds one long-lived connection per process.
 
 Streamlit Community Cloud has an ephemeral filesystem, so a SQLite file there is
 wiped on every reboot and redeploy. Set DATABASE_URL in the Cloud secrets to keep
@@ -19,6 +23,16 @@ from contextlib import contextmanager
 from datetime import datetime
 
 import streamlit as st
+
+try:
+    from dotenv import load_dotenv
+
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    # Real environment wins, then .env.local (written by `neon env pull`), then .env.
+    load_dotenv(os.path.join(_HERE, ".env.local"))
+    load_dotenv(os.path.join(_HERE, ".env"))
+except ImportError:
+    pass
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "funky_fresh.db")
 
@@ -149,14 +163,17 @@ def init_db():
         )
     """)
 
-    # Migration: add google_id to databases created before Google login existed.
-    if is_postgres():
-        _execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT")
-    else:
-        try:
-            _execute("ALTER TABLE users ADD COLUMN google_id TEXT")
-        except sqlite3.OperationalError:
-            pass  # already there
+    # Migrations: identity columns added after the users table first shipped.
+    # neon_auth_id holds neon_auth.user.id (a UUID) for Neon Auth accounts.
+    for column in ("google_id", "neon_auth_id"):
+        if is_postgres():
+            _execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} TEXT")
+        else:
+            try:
+                _execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError:
+                pass  # already there
+    _execute("CREATE UNIQUE INDEX IF NOT EXISTS users_neon_auth_id ON users (neon_auth_id)")
 
 
 # -- Passwords -----------------------------------------------------------------
@@ -219,13 +236,7 @@ def authenticate(username: str, password: str):
     return {"id": row["id"], "username": row["username"]}
 
 
-def find_or_create_google_user(google_id: str, email: str, name: str) -> dict:
-    """Find an existing Google-linked account or create a new one."""
-    row = _query_one("SELECT id, username FROM users WHERE google_id = ?", (google_id,))
-    if row:
-        return {"id": row["id"], "username": row["username"]}
-
-    # New Google user - derive a unique username from their name/email
+def _unique_username(name: str, email: str) -> str:
     base = name.split()[0] if name else email.split("@")[0]
     base = "".join(c for c in base if c.isalnum())[:20] or "user"
     username = base
@@ -233,13 +244,32 @@ def find_or_create_google_user(google_id: str, email: str, name: str) -> dict:
     while _query_one("SELECT id FROM users WHERE username = ?", (username,)):
         username = f"{base}{suffix}"
         suffix += 1
+    return username
 
+
+def _find_or_create_external_user(column: str, external_id: str, email: str, name: str) -> dict:
+    """Map an identity-provider user onto a row in our users table."""
+    row = _query_one(f"SELECT id, username FROM users WHERE {column} = ?", (external_id,))
+    if row:
+        return {"id": row["id"], "username": row["username"]}
+
+    username = _unique_username(name, email)
     _execute(
-        "INSERT INTO users (username, password_hash, google_id) VALUES (?, '', ?)",
-        (username, google_id),
+        f"INSERT INTO users (username, password_hash, {column}) VALUES (?, '', ?)",
+        (username, external_id),
     )
-    created = _query_one("SELECT id FROM users WHERE google_id = ?", (google_id,))
+    created = _query_one(f"SELECT id FROM users WHERE {column} = ?", (external_id,))
     return {"id": created["id"], "username": username}
+
+
+def find_or_create_google_user(google_id: str, email: str, name: str) -> dict:
+    """Find an existing Google-linked account or create a new one."""
+    return _find_or_create_external_user("google_id", google_id, email, name)
+
+
+def find_or_create_neon_user(neon_auth_id: str, email: str, name: str) -> dict:
+    """Find or create the app user for a Neon Auth user (neon_auth.user.id)."""
+    return _find_or_create_external_user("neon_auth_id", neon_auth_id, email, name)
 
 
 # -- History -------------------------------------------------------------------

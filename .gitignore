@@ -15,3 +15,6 @@ __pycache__/
 
 # Claude
 .claude/
+.neon
+node_modules/
+.env.local

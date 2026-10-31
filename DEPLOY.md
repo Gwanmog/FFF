@@ -1,7 +1,7 @@
 # Deploying Funky Fresh Friday
 
-Getting the app live on Streamlit Community Cloud, free, with working accounts,
-Google login, and live country data.
+Getting the app live on Streamlit Community Cloud, free, with working accounts
+(Neon Auth email/password plus Google login) and live country data.
 
 Two things differ from running locally, and both will bite you if skipped:
 
@@ -27,7 +27,7 @@ git push
 `.streamlit/secrets.toml` is gitignored, so your real keys stay out of the public
 repo. Only `.streamlit/secrets.toml.example` is committed.
 
-## 2. Create a free Postgres database
+## 2. Set up Neon (Postgres + Auth)
 
 **Use [Neon](https://neon.tech), not Supabase.** Supabase's free tier pauses a
 project after about 7 days of inactivity and needs a *manual* unpause from the
@@ -35,19 +35,36 @@ dashboard — for an app used once a week, that's a coin flip on whether Friday
 works. Neon auto-suspends when idle but resumes automatically on the next
 connection.
 
-1. Sign up and create a project.
-2. Copy the connection string — it looks like
-   `postgresql://user:password@host.neon.tech/dbname?sslmode=require`.
-3. Keep it handy for step 5.
+This repo is already linked to a Neon project (`.neon`, gitignored) and
+declares its services in `neon.ts`: Postgres plus Neon Auth, which handles
+email/password sign-up and login. To provision them and pull credentials:
+
+```bash
+npm i -g neon@latest
+neon deploy          # signs you in on first run, then writes .env.local
+```
+
+`.env.local` (gitignored) now holds what the app needs, and the app reads it
+automatically when running locally:
+
+- `DATABASE_URL` — the **pooled** connection string (host contains `-pooler`).
+  Use this one, not `DATABASE_URL_UNPOOLED`.
+- `NEON_AUTH_BASE_URL` — the Neon Auth endpoint.
+
+Keep both handy for step 5. Check them with `python check_setup.py`; the
+database and neon auth lines should both say `[ok]`.
+
+On a fresh clone or another machine, run `neon link` first, then `neon deploy`.
 
 Free tiers change; check the current terms when you sign up.
 
 <details>
-<summary>Using Supabase instead</summary>
+<summary>Using Supabase or another Postgres instead</summary>
 
-Project Settings → Database → Connection string → URI. Use the **Transaction
-pooler** host (port `6543`), not the direct connection. Be aware of the pausing
-behaviour above.
+Set only `DATABASE_URL` and leave `NEON_AUTH_BASE_URL` unset; the app then falls
+back to its built-in username/password login. For Supabase: Project Settings →
+Database → Connection string → URI, using the **Transaction pooler** host (port
+`6543`). Be aware of the pausing behaviour above.
 </details>
 
 ## 3. Get a country-facts API key
@@ -88,7 +105,8 @@ GOOGLE_CLIENT_ID = "reuse-your-existing-value"
 GOOGLE_CLIENT_SECRET = "reuse-your-existing-value"
 
 APP_URL = "https://your-subdomain.streamlit.app"
-DATABASE_URL = "postgresql://...from-step-2..."
+DATABASE_URL = "postgresql://...pooled DATABASE_URL from .env.local..."
+NEON_AUTH_BASE_URL = "https://...NEON_AUTH_BASE_URL from .env.local..."
 ```
 
 Then click **Deploy**. First build takes a few minutes.
@@ -96,7 +114,20 @@ Then click **Deploy**. First build takes a few minutes.
 You can edit secrets later from the app's ⋮ menu → **Settings → Secrets**. Saving
 reboots the app.
 
-## 6. Authorize the URL with Google
+## 6. Authorize the URL with Neon Auth and Google
+
+### Neon Auth
+
+Neon Auth only accepts requests from trusted domains. Localhost is trusted by
+default; the deployed URL is not, so email login fails until you add it:
+
+```bash
+neon neon-auth domain add https://your-subdomain.streamlit.app
+```
+
+Same rule as below: it must match `APP_URL` exactly, no trailing slash.
+
+### Google
 
 Otherwise "Continue with Google" fails.
 
@@ -116,7 +147,9 @@ Changes can take a few minutes to take effect on Google's side.
 
 Open the URL and:
 
-- Sign up for an account, log out, log back in — confirms Postgres is wired up.
+- Sign up with an email and password, log out, log back in — confirms Neon
+  Auth and Postgres are wired up. A wrong password should show "Invalid email
+  or password".
 - Spin the globe. The Quick Facts card should show a flag, capital and
   population, with **no** warning caption underneath.
 - Reboot the app from the Streamlit dashboard, then log in again. If your account
@@ -143,6 +176,7 @@ Every key is optional. With none set, the app still runs.
 | `GOOGLE_CLIENT_ID` / `_SECRET` | "Continue with Google" | Button hidden, username/password still works |
 | `APP_URL` | Google redirect target | Defaults to `http://localhost:8501` |
 | `DATABASE_URL` | Postgres storage | Local SQLite file — **wiped on every Cloud reboot** |
+| `NEON_AUTH_BASE_URL` | Email/password login via Neon Auth | Built-in username/password login |
 
 ## Troubleshooting
 
@@ -150,6 +184,8 @@ Every key is optional. With none set, the app still runs.
 | --- | --- |
 | Build fails on `psycopg2` | Python version not pinned to 3.12 in Advanced settings |
 | Accounts vanish after a reboot | `DATABASE_URL` not set or not being read — still on SQLite |
+| Email login/sign-up fails only on the deployed app | Deployed URL not added with `neon neon-auth domain add`, or `APP_URL` doesn't match it |
+| Email login shows the old username form | `NEON_AUTH_BASE_URL` not set in secrets |
 | `redirect_uri_mismatch` on Google login | `APP_URL` and the Google Authorized redirect URI don't match exactly |
 | Google login works for you, nobody else | OAuth consent screen still in *Testing* — add test users or publish |
 | ⚠️ caption under the facts card | Read it — it names the exact failure (no key, bad key, rate limit, no match) |
@@ -160,6 +196,6 @@ Every key is optional. With none set, the app still runs.
 
 - **Existing local data does not migrate.** The 2 accounts and 28 visited
   countries in your local `funky_fresh.db` stay local; the deployed app starts
-  empty.
+  empty. Users sign up again with an email via Neon Auth.
 - **The repo is public.** Any credential that has ever been pasted somewhere
   shared is worth rotating.

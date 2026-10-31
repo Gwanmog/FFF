@@ -118,6 +118,46 @@ def check_google() -> bool:
     return True
 
 
+def check_neon_auth() -> bool:
+    """Full round trip: sign up a throwaway user, check the session, sign out, sign back in."""
+    import secrets
+
+    import neon_auth
+
+    if not neon_auth.neon_auth_enabled():
+        print(f"{WARN} neon auth: NEON_AUTH_BASE_URL not set - using local username/password")
+        return False
+
+    email = f"setup-check+{secrets.token_hex(4)}@example.com"
+    password = secrets.token_urlsafe(12)
+    try:
+        created = neon_auth.sign_up(email, password, "Setup Check")
+        if not neon_auth.get_session(created["token"]):
+            raise neon_auth.NeonAuthError("new session not found by get-session")
+        neon_auth.sign_out(created["token"])
+        if neon_auth.get_session(created["token"]):
+            raise neon_auth.NeonAuthError("session still live after sign-out")
+        again = neon_auth.sign_in(email, password)
+        try:
+            neon_auth.sign_in(email, password + "x")
+            raise neon_auth.NeonAuthError("wrong password was accepted")
+        except neon_auth.NeonAuthError as e:
+            if "accepted" in str(e):
+                raise
+        neon_auth.sign_out(again["token"])
+    except neon_auth.NeonAuthError as e:
+        print(f"{FAIL} neon auth: {e}")
+        return False
+    finally:
+        if db.is_postgres():
+            try:  # don't leave the throwaway user behind
+                db._execute("DELETE FROM neon_auth.user WHERE email = ?", (email,))
+            except Exception:
+                pass
+    print(f"{OK} neon auth: sign-up, session, sign-out, sign-in, bad-password all behave")
+    return True
+
+
 def main() -> int:
     full = "--facts" in sys.argv
     print("Funky Fresh Friday - setup check")
@@ -127,6 +167,7 @@ def main() -> int:
     check_facts(full)
     check_spotify()
     check_google()
+    check_neon_auth()
 
     print("-" * 40)
     if not ok_db:

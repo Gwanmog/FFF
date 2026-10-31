@@ -3,7 +3,8 @@
 import os
 import random
 import streamlit as st
-from db import init_db, create_user, authenticate, find_or_create_google_user, get_past_countries, add_country, clear_history, remove_country
+from db import init_db, create_user, authenticate, find_or_create_google_user, find_or_create_neon_user, get_past_countries, add_country, clear_history, remove_country
+import neon_auth
 from countries import COUNTRIES
 from culture_data import get_music_data, get_food_data, get_movie_data
 from spotify import spotify_enabled, search_country_playlists
@@ -219,6 +220,8 @@ if "show_balloons" not in st.session_state:
     st.session_state.show_balloons = False
 if "google_oauth_state" not in st.session_state:
     st.session_state.google_oauth_state = None
+if "neon_session_token" not in st.session_state:
+    st.session_state.neon_session_token = None
 
 # ── Handle Google OAuth callback ───────────────────────────────────────────────
 # Google redirects back to APP_URL?code=...&state=...
@@ -279,9 +282,13 @@ def auth_screen():
                 unsafe_allow_html=True,
             )
             st.markdown(
-                '<p style="text-align:center; color:#888; font-size:0.85rem;">— or use username/password —</p>',
+                f'<p style="text-align:center; color:#888; font-size:0.85rem;">— or use {"email" if neon_auth.neon_auth_enabled() else "username"}/password —</p>',
                 unsafe_allow_html=True,
             )
+
+        if neon_auth.neon_auth_enabled():
+            _neon_auth_forms()
+            return
 
         tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
 
@@ -313,6 +320,51 @@ def auth_screen():
                         st.success("Account created! Switch to Login tab.")
                     else:
                         st.error("Username already taken.")
+
+
+def _neon_login(result: dict):
+    """Attach a Neon Auth session to this Streamlit session."""
+    st.session_state.neon_session_token = result["token"]
+    st.session_state.user = find_or_create_neon_user(
+        neon_auth_id=result["id"], email=result["email"], name=result["name"],
+    )
+    st.rerun()
+
+
+def _neon_auth_forms():
+    """Email/password login backed by Neon Auth (Managed Better Auth)."""
+    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
+
+    with tab_login:
+        with st.form("neon_login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            if st.form_submit_button("Login", use_container_width=True):
+                try:
+                    result = neon_auth.sign_in(email.strip(), password)
+                except neon_auth.NeonAuthError as e:
+                    st.error(f"{e}. Try again or sign up.")
+                else:
+                    _neon_login(result)
+
+    with tab_signup:
+        with st.form("neon_signup_form"):
+            name = st.text_input("Your Name")
+            email = st.text_input("Email")
+            new_pass = st.text_input("Choose a Password (8+ characters)", type="password")
+            confirm = st.text_input("Confirm Password", type="password")
+            if st.form_submit_button("Create Account", use_container_width=True):
+                if not name or not email or not new_pass:
+                    st.error("Name, email and password required.")
+                elif new_pass != confirm:
+                    st.error("Passwords don't match.")
+                else:
+                    try:
+                        result = neon_auth.sign_up(email.strip(), new_pass, name.strip())
+                    except neon_auth.NeonAuthError as e:
+                        st.error(str(e))
+                    else:
+                        _neon_login(result)
 
 
 # ── Sidebar passport ──────────────────────────────────────────────────────────
@@ -390,6 +442,9 @@ def render_sidebar():
 
         st.markdown("---")
         if st.button("🚪 Logout", use_container_width=True):
+            if st.session_state.neon_session_token:
+                neon_auth.sign_out(st.session_state.neon_session_token)
+                st.session_state.neon_session_token = None
             st.session_state.user = None
             st.session_state.current_country = None
             st.rerun()
@@ -635,6 +690,20 @@ def main_app():
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
+# Neon Auth sessions expire or get revoked server-side. Re-check every few
+# minutes (not on every rerun: each check is a network round trip).
+_NEON_SESSION_RECHECK_S = 300
+if st.session_state.user is not None and st.session_state.neon_session_token:
+    import time
+
+    if time.time() - st.session_state.get("neon_session_checked_at", 0) > _NEON_SESSION_RECHECK_S:
+        if neon_auth.get_session(st.session_state.neon_session_token):
+            st.session_state.neon_session_checked_at = time.time()
+        else:
+            st.session_state.user = None
+            st.session_state.neon_session_token = None
+            st.session_state.current_country = None
 
 if st.session_state.user is None:
     auth_screen()
